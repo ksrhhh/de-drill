@@ -1,5 +1,6 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { LIBRARY } from './library.js';
+import { SEED_MOTIONS, inferTopic } from './motions.js';
 
 // ===========================================================================
 // Debate Drill — burden/mechanism trainer + de-brief reader
@@ -37,6 +38,7 @@ const K_QUEUE = 'drill:approval-queue';
 const K_FLASH = 'drill:flashcard-history';
 const K_SETTINGS = 'drill:settings';
 const K_BRIEF_CACHE = 'drill:brief-cache';
+const K_MOTIONS = 'drill:motions';
 
 // Persistence via localStorage (survives refresh, per-browser).
 const mem = {};
@@ -102,6 +104,18 @@ Generate 3 candidates. Do not duplicate the existing claims provided.`;
   const userPrompt = `Topic: ${topic}\nExisting claims already in the library for this topic:\n${existingClaims.join('\n')}\n\nGenerate 3 new candidate arguments for this topic.`;
   const cleaned = await callClaude(systemPrompt, userPrompt, 1200);
   return JSON.parse(cleaned).candidates;
+}
+
+async function generateMotionBurden(motion, side, infoSlide) {
+  const systemPrompt = `You are a BP/Parli debate coach. Given a real motion and the side the \
+debater must argue, name ONE specific, high-value stock argument/claim they should build for that \
+side — the kind of claim that, once burdened and mechanised, wins the room. Phrase it as a single \
+crisp claim sentence, exactly like a stock-argument library entry (not a whole case).
+
+Respond in this exact JSON shape, nothing else: {"side": "...", "claim": "..."}`;
+  const userPrompt = `Motion: ${motion}\nSide to argue: ${side}\n${infoSlide ? `Info slide: ${infoSlide}\n` : ''}\nGive one strong claim for this side to build.`;
+  const cleaned = await callClaude(systemPrompt, userPrompt, 400);
+  return JSON.parse(cleaned);
 }
 
 // --- tiny markdown renderer (headings, bold, italic, lists, hr, code) ------
@@ -199,10 +213,11 @@ export default function DrillTool() {
   const [history, setHistory] = useState([]);
   const [flashHistory, setFlashHistory] = useState([]);
   const [queue, setQueue] = useState([]);
+  const [motions, setMotions] = useState([]);
   const [loaded, setLoaded] = useState(false);
 
-  const [tab, setTab] = useState('drill');        // drill | cards | brief | stats | more
-  const [overlay, setOverlay] = useState(null);   // null | 'import' | 'queue' | 'settings'
+  const [tab, setTab] = useState('drill');        // drill | cards | brief | motions | more
+  const [overlay, setOverlay] = useState(null);   // null | 'import' | 'queue' | 'settings' | 'stats'
 
   const [targetSeconds, setTargetSeconds] = useState(180);
   const [filterTopic, setFilterTopic] = useState('all');
@@ -225,8 +240,8 @@ export default function DrillTool() {
 
   useEffect(() => {
     (async () => {
-      const [h, lib, q, fh, set] = await Promise.all([
-        sGet(K_HISTORY), sGet(K_LIBRARY), sGet(K_QUEUE), sGet(K_FLASH), sGet(K_SETTINGS),
+      const [h, lib, q, fh, set, mo] = await Promise.all([
+        sGet(K_HISTORY), sGet(K_LIBRARY), sGet(K_QUEUE), sGet(K_FLASH), sGet(K_SETTINGS), sGet(K_MOTIONS),
       ]);
       if (h) setHistory(h);
       if (lib && lib.length) {
@@ -239,6 +254,12 @@ export default function DrillTool() {
       if (q) setQueue(q);
       if (fh) setFlashHistory(fh);
       if (set?.targetSeconds) setTargetSeconds(set.targetSeconds);
+      if (mo && mo.length) {
+        setMotions(mo);
+      } else {
+        setMotions(SEED_MOTIONS);
+        await sSet(K_MOTIONS, SEED_MOTIONS);
+      }
       setLoaded(true);
     })();
   }, []);
@@ -337,6 +358,70 @@ export default function DrillTool() {
   const resetProgress = async () => { await sDel(K_HISTORY); await sDel(K_FLASH); setHistory([]); setFlashHistory([]); };
   const updateTarget = async (v) => { setTargetSeconds(v); await sSet(K_SETTINGS, { targetSeconds: v }); };
 
+  // ---- motions ----
+  const persistMotions = async (next) => { setMotions(next); await sSet(K_MOTIONS, next); };
+
+  const logMotion = async ({ motion, side, note, topic }) => {
+    const inferred = topic || inferTopic(motion, '') || null;
+    const entry = {
+      id: `logged-${Date.now()}`, motion: motion.trim(), tag: null, round: null,
+      tournament: 'My round', infoSlide: null, sideBias: null,
+      topic: inferred, side: side || null, note: note?.trim() || null,
+      source: 'logged', timestamp: new Date().toISOString(),
+    };
+    await persistMotions([entry, ...motions]);
+  };
+
+  const importMotionsFromCalico = async (url) => {
+    const res = await fetch('/api/motions', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ url }),
+    });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error || `Import failed (${res.status})`);
+    const existing = new Set(motions.map(m => `${m.tournament}|${m.motion}`));
+    const fresh = data.motions
+      .map((m, i) => ({
+        id: `calico-${Date.now()}-${i}`,
+        motion: m.motion, tag: m.tag || null, round: m.round || null,
+        tournament: data.tournament || 'Imported', infoSlide: m.infoSlide || null,
+        sideBias: null, topic: inferTopic(m.motion, m.infoSlide), side: null,
+        note: null, source: data.tournament || 'Calico import', timestamp: new Date().toISOString(),
+      }))
+      .filter(m => !existing.has(`${m.tournament}|${m.motion}`));
+    await persistMotions([...fresh, ...motions]);
+    return { added: fresh.length, tournament: data.tournament };
+  };
+
+  const deleteMotion = async (id) => { await persistMotions(motions.filter(m => m.id !== id)); };
+
+  // Drill from a motion: prefer a real library entry matching the motion's topic;
+  // fall back to AI-generated burden only when nothing matches.
+  const drillFromMotion = async (motion, side) => {
+    setTab('drill'); setAnswer(''); setGradeResult(null); setGradeError(null);
+    const matches = motion.topic ? library.filter(a => a.topic === motion.topic) : [];
+    let entry;
+    if (matches.length) {
+      const picked = pickEntry(matches);
+      entry = { ...picked, side: side || picked.side, _motion: motion.motion, _fromMotion: true };
+    } else {
+      // AI fallback
+      setCurrent({ id: `motion-loading`, topic: motion.topic || 'Motion', side: side || 'Government',
+        claim: 'Generating a target burden for this motion…', _motion: motion.motion, _fromMotion: true, _loading: true });
+      setPhase('running'); setRunning(false); setSeconds(0);
+      try {
+        const gen = await generateMotionBurden(motion.motion, side || 'Government', motion.infoSlide);
+        entry = { id: `motion-${Date.now()}`, topic: motion.topic || 'Motion', side: gen.side || side || 'Government',
+          claim: gen.claim, mechanism: '', _motion: motion.motion, _fromMotion: true, _aiGenerated: true };
+      } catch (e) {
+        setGradeError('Could not generate a target for this motion — try another, or check your API key.');
+        entry = { id: `motion-${Date.now()}`, topic: motion.topic || 'Motion', side: side || 'Government',
+          claim: `Build the strongest case for ${side || 'Government'} on this motion.`, _motion: motion.motion, _fromMotion: true };
+      }
+    }
+    setCurrent(entry); setSeconds(0); setPhase('running'); setRunning(true);
+  };
+
   if (!loaded) return <div style={shell}><div style={{ color: '#8A8A92', fontFamily: "'Inter', sans-serif" }}>Loading…</div></div>;
 
   const inSession = (tab === 'drill' && phase !== 'idle') || (tab === 'cards' && flashStep !== 'idle');
@@ -370,15 +455,25 @@ export default function DrillTool() {
           )}
 
           {tab === 'brief' && <BriefTab />}
-          {tab === 'stats' && <StatsTab history={history} flashHistory={flashHistory} />}
+          {tab === 'motions' && (
+            <MotionsTab motions={motions} libraryTopics={topics}
+              onDrill={drillFromMotion} onLog={logMotion} onImport={importMotionsFromCalico} onDelete={deleteMotion} />
+          )}
           {tab === 'more' && (
-            <MoreTab librarySize={library.length} queueCount={queue.length}
-              onImport={() => setOverlay('import')} onQueue={() => setOverlay('queue')} onSettings={() => setOverlay('settings')} />
+            <MoreTab librarySize={library.length} queueCount={queue.length} motionCount={motions.length}
+              onImport={() => setOverlay('import')} onQueue={() => setOverlay('queue')}
+              onSettings={() => setOverlay('settings')} onStats={() => setOverlay('stats')} />
           )}
         </div>
 
         {!inSession && <TabBar tab={tab} setTab={setTab} queueCount={queue.length} />}
       </div>
+
+      {overlay === 'stats' && (
+        <Overlay title="Progress" onClose={() => setOverlay(null)}>
+          <StatsTab history={history} flashHistory={flashHistory} embedded />
+        </Overlay>
+      )}
 
       {overlay === 'import' && <ImportOverlay onClose={() => setOverlay(null)} onImport={importLibrary} librarySize={library.length} />}
       {overlay === 'queue' && <QueueOverlay onClose={() => setOverlay(null)} queue={queue} topics={topics}
@@ -398,7 +493,7 @@ function TabBar({ tab, setTab, queueCount }) {
     { id: 'drill', label: 'Drill', icon: '◷' },
     { id: 'cards', label: 'Cards', icon: '▭' },
     { id: 'brief', label: 'Brief', icon: '✦' },
-    { id: 'stats', label: 'Stats', icon: '▤' },
+    { id: 'motions', label: 'Motions', icon: '⚑' },
     { id: 'more', label: 'More', icon: '⋯' },
   ];
   return (
@@ -489,6 +584,16 @@ function DrillRun({ entry, seconds, targetSeconds, running, answer, setAnswer, o
         <button onClick={onQuit} style={ghostBtn}>← End round</button>
         <button onClick={onSkip} style={ghostBtn}>Skip →</button>
       </div>
+
+      {entry._fromMotion && (
+        <div style={{ ...card, marginBottom: 12, borderColor: '#C9A96155', background: '#17150F' }}>
+          <div style={label}>Motion</div>
+          <div style={{ fontFamily: "'Source Serif 4', serif", fontSize: 15.5, color: '#F5F1E8', lineHeight: 1.4 }}>{entry._motion}</div>
+          <div style={{ fontFamily: "'Inter', sans-serif", fontSize: 11.5, color: entry._aiGenerated ? '#C9A961' : '#5B7A6B', marginTop: 8 }}>
+            {entry._aiGenerated ? 'AI-suggested target (no library match)' : 'Target pulled from your library'}
+          </div>
+        </div>
+      )}
 
       <div style={card}>
         <div style={label}>Topic</div>
@@ -749,14 +854,195 @@ function BriefTab() {
 }
 
 // ===========================================================================
+// MOTIONS
+// ===========================================================================
+function MotionsTab({ motions, libraryTopics, onDrill, onLog, onImport, onDelete }) {
+  const [mode, setMode] = useState('browse'); // browse | log | import
+  const [filter, setFilter] = useState('all');
+  const [picked, setPicked] = useState(null); // motion awaiting side choice
+
+  const topics = ['all', ...[...new Set(motions.map(m => m.topic).filter(Boolean))].sort()];
+  const shown = filter === 'all' ? motions : motions.filter(m => m.topic === filter);
+
+  return (
+    <div style={{ padding: '36px 20px 0' }}>
+      <Eyebrow>Motions</Eyebrow>
+      <div style={{ fontFamily: "'JetBrains Mono', monospace", fontSize: 12.5, color: '#5C5C62', marginBottom: 20 }}>
+        {motions.length} motions · drill against the real thing
+      </div>
+
+      <div style={{ display: 'flex', gap: 8, marginBottom: 20 }}>
+        {[['browse', 'Browse'], ['log', 'Log a round'], ['import', 'Import']].map(([id, lbl]) => {
+          const a = mode === id;
+          return (
+            <button key={id} onClick={() => setMode(id)} style={{
+              flex: 1, padding: '9px 0', borderRadius: 10, cursor: 'pointer',
+              fontFamily: "'Inter', sans-serif", fontSize: 13, fontWeight: a ? 600 : 400,
+              background: a ? '#C9A961' : '#161618', color: a ? '#0E0E10' : '#8A8A92',
+              border: `1px solid ${a ? '#C9A961' : '#2A2A2E'}`,
+            }}>{lbl}</button>
+          );
+        })}
+      </div>
+
+      {mode === 'log' && <LogMotionForm libraryTopics={libraryTopics} onLog={async (d) => { await onLog(d); setMode('browse'); }} />}
+      {mode === 'import' && <ImportMotionsForm onImport={onImport} />}
+
+      {mode === 'browse' && (
+        <>
+          {topics.length > 2 && (
+            <div style={{ display: 'flex', gap: 7, overflowX: 'auto', paddingBottom: 6, marginBottom: 16 }}>
+              {topics.map(t => {
+                const a = filter === t;
+                return (
+                  <button key={t} onClick={() => setFilter(t)} style={{
+                    flexShrink: 0, padding: '6px 12px', borderRadius: 100, cursor: 'pointer',
+                    fontFamily: "'Inter', sans-serif", fontSize: 12,
+                    background: a ? '#2A2A2E' : 'transparent', color: a ? '#F5F1E8' : '#8A8A92',
+                    border: `1px solid ${a ? '#3A3A3E' : '#222226'}`, whiteSpace: 'nowrap',
+                  }}>{t === 'all' ? 'All' : t}</button>
+                );
+              })}
+            </div>
+          )}
+          {shown.length === 0 ? (
+            <div style={card}>
+              <div style={{ fontFamily: "'Inter', sans-serif", fontSize: 14, color: '#8A8A92', lineHeight: 1.55 }}>
+                No motions here yet. Log a round you just debated, or import a tournament.
+              </div>
+            </div>
+          ) : shown.map(m => (
+            <MotionCard key={m.id} motion={m} onDrill={() => setPicked(m)} onDelete={() => onDelete(m.id)} />
+          ))}
+        </>
+      )}
+
+      {picked && <SideChoiceOverlay motion={picked} onClose={() => setPicked(null)}
+        onChoose={(side) => { setPicked(null); onDrill(picked, side); }} />}
+    </div>
+  );
+}
+
+function MotionCard({ motion, onDrill, onDelete }) {
+  const [confirmDel, setConfirmDel] = useState(false);
+  const bias = motion.sideBias;
+  return (
+    <div style={{ ...card, marginBottom: 12 }}>
+      <div style={{ display: 'flex', justifyContent: 'space-between', gap: 10 }}>
+        <div style={{ fontFamily: "'JetBrains Mono', monospace", fontSize: 11, color: '#8A8A92' }}>
+          {motion.round ? `${motion.round} · ` : ''}{motion.tournament}
+        </div>
+        {motion.topic && <div style={{ fontFamily: "'Inter', sans-serif", fontSize: 10.5, color: '#C9A961', border: '1px solid #C9A96144', borderRadius: 100, padding: '2px 9px', whiteSpace: 'nowrap' }}>{motion.topic}</div>}
+      </div>
+      <div style={{ fontFamily: "'Source Serif 4', serif", fontSize: 16, color: '#F5F1E8', lineHeight: 1.4, margin: '10px 0 6px' }}>{motion.motion}</div>
+      {motion.tag && <div style={{ fontFamily: "'JetBrains Mono', monospace", fontSize: 11.5, color: '#5C5C62', marginBottom: 8 }}>({motion.tag})</div>}
+      {motion.note && <div style={{ fontFamily: "'Inter', sans-serif", fontSize: 13, color: '#A8453C', lineHeight: 1.5, marginBottom: 8 }}>Struggled: {motion.note}</div>}
+      {motion.infoSlide && <details style={{ marginBottom: 10 }}>
+        <summary style={{ fontFamily: "'Inter', sans-serif", fontSize: 12, color: '#8A8A92', cursor: 'pointer' }}>Info slide</summary>
+        <div style={{ fontFamily: "'Source Serif 4', serif", fontSize: 13.5, color: '#D8D4C8', lineHeight: 1.6, marginTop: 8 }}>{motion.infoSlide}</div>
+      </details>}
+      {bias && (bias.gov != null) && (
+        <div style={{ display: 'flex', gap: 12, fontFamily: "'JetBrains Mono', monospace", fontSize: 11, color: '#8A8A92', marginBottom: 12 }}>
+          <span>Gov <span style={{ color: bias.gov >= bias.opp ? '#5B7A6B' : '#A8453C' }}>{bias.gov.toFixed(2)}</span></span>
+          <span>Opp <span style={{ color: bias.opp >= bias.gov ? '#5B7A6B' : '#A8453C' }}>{bias.opp.toFixed(2)}</span></span>
+        </div>
+      )}
+      <div style={{ display: 'flex', gap: 8 }}>
+        <button onClick={onDrill} style={{ ...primaryBtn, flex: 1, padding: '10px 0', fontSize: 14 }}>Drill this</button>
+        {confirmDel ? (
+          <button onClick={onDelete} style={{ ...secondaryBtn, padding: '10px 14px', borderColor: '#A8453C', color: '#A8453C' }}>Sure?</button>
+        ) : (
+          <button onClick={() => setConfirmDel(true)} style={{ ...secondaryBtn, padding: '10px 14px', color: '#5C5C62', borderColor: '#2A2A2E' }}>✕</button>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function LogMotionForm({ libraryTopics, onLog }) {
+  const [motion, setMotion] = useState('');
+  const [side, setSide] = useState('');
+  const [note, setNote] = useState('');
+  const [topic, setTopic] = useState('');
+  return (
+    <div>
+      <div style={{ color: '#8A8A92', fontFamily: "'Inter', sans-serif", fontSize: 13, marginBottom: 14, lineHeight: 1.55 }}>
+        Fast capture, right after a round. Just the motion and what tripped you up — drill it later.
+      </div>
+      <div style={label}>Motion</div>
+      <textarea value={motion} onChange={e => setMotion(e.target.value)} placeholder="THW / THBT / THS…"
+        style={{ ...textarea, minHeight: 70, marginBottom: 14 }} />
+      <div style={label}>Side you were on (optional)</div>
+      <div style={{ display: 'flex', gap: 8, marginBottom: 14 }}>
+        {['Gov', 'Opp', ''].map((s, i) => {
+          const lbls = ['Gov', 'Opp', 'Skip'];
+          const a = side === s;
+          return <button key={i} onClick={() => setSide(s)} style={{ flex: 1, padding: '9px 0', borderRadius: 8, cursor: 'pointer', fontFamily: "'Inter', sans-serif", fontSize: 13, background: a ? '#2A2A2E' : '#161618', color: a ? '#F5F1E8' : '#8A8A92', border: '1px solid #2A2A2E' }}>{lbls[i]}</button>;
+        })}
+      </div>
+      <div style={label}>What did you struggle with? (optional)</div>
+      <input value={note} onChange={e => setNote(e.target.value)} placeholder="e.g. couldn't find a mechanism for the econ burden"
+        style={{ ...select, marginBottom: 14 }} />
+      <div style={label}>Topic (optional — auto-detected if blank)</div>
+      <select value={topic} onChange={e => setTopic(e.target.value)} style={{ ...select, marginBottom: 18 }}>
+        <option value="">Auto-detect</option>
+        {libraryTopics.map(t => <option key={t} value={t}>{t}</option>)}
+      </select>
+      <button onClick={() => motion.trim() && onLog({ motion, side, note, topic })} disabled={!motion.trim()}
+        style={{ ...primaryBtn, width: '100%', opacity: motion.trim() ? 1 : 0.5 }}>Log it</button>
+    </div>
+  );
+}
+
+function ImportMotionsForm({ onImport }) {
+  const [url, setUrl] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [status, setStatus] = useState(null);
+  const run = async () => {
+    setBusy(true); setStatus(null);
+    try { const r = await onImport(url.trim()); setStatus({ ok: true, msg: `Added ${r.added} motions from ${r.tournament || 'the tournament'}.` }); setUrl(''); }
+    catch (e) { setStatus({ ok: false, msg: e.message }); }
+    setBusy(false);
+  };
+  return (
+    <div>
+      <div style={{ color: '#8A8A92', fontFamily: "'Inter', sans-serif", fontSize: 13, marginBottom: 14, lineHeight: 1.55 }}>
+        Paste a Calico Tab tournament link (the Motions tab). It'll pull every round's motion, info slide, and tag automatically.
+      </div>
+      <input value={url} onChange={e => setUrl(e.target.value)} placeholder="https://…calicotab.com/…/motions/statistics/"
+        style={{ ...select, marginBottom: 12, fontFamily: "'JetBrains Mono', monospace", fontSize: 12 }} />
+      {status && <div style={{ color: status.ok ? '#5B7A6B' : '#A8453C', fontSize: 13, fontFamily: "'Inter', sans-serif", marginBottom: 12, lineHeight: 1.5 }}>{status.msg}</div>}
+      <button onClick={run} disabled={busy || !url.trim()} style={{ ...primaryBtn, width: '100%', opacity: (busy || !url.trim()) ? 0.5 : 1 }}>{busy ? 'Importing…' : 'Import tournament'}</button>
+    </div>
+  );
+}
+
+function SideChoiceOverlay({ motion, onClose, onChoose }) {
+  return (
+    <Overlay title="Which side?" onClose={onClose}>
+      <div style={{ fontFamily: "'Source Serif 4', serif", fontSize: 16, color: '#F5F1E8', lineHeight: 1.4, marginBottom: 6 }}>{motion.motion}</div>
+      {motion.topic && <div style={{ fontFamily: "'Inter', sans-serif", fontSize: 12, color: '#C9A961', marginBottom: 18 }}>{motion.topic}</div>}
+      <div style={{ color: '#8A8A92', fontFamily: "'Inter', sans-serif", fontSize: 13, marginBottom: 16, lineHeight: 1.55 }}>
+        Pick a side to argue. We'll pull a target burden from your library for this topic — or have the AI suggest one if nothing matches.
+      </div>
+      <div style={{ display: 'flex', gap: 10 }}>
+        <button onClick={() => onChoose('Government')} style={{ ...primaryBtn, flex: 1 }}>Government</button>
+        <button onClick={() => onChoose('Opposition')} style={{ ...primaryBtn, flex: 1, background: '#5B7A6B', color: '#0E0E10' }}>Opposition</button>
+      </div>
+    </Overlay>
+  );
+}
+
+// ===========================================================================
 // STATS
 // ===========================================================================
-function StatsTab({ history, flashHistory }) {
+function StatsTab({ history, flashHistory, embedded }) {
+  const pad = embedded ? '0' : '36px 20px 0';
   if (!history.length && !flashHistory.length) {
     return (
-      <div style={{ padding: '36px 20px 0' }}>
-        <Eyebrow>Progress</Eyebrow>
-        <div style={{ marginTop: 20, ...card }}>
+      <div style={{ padding: pad }}>
+        {!embedded && <Eyebrow>Progress</Eyebrow>}
+        <div style={{ marginTop: embedded ? 0 : 20, ...card }}>
           <div style={{ fontFamily: "'Inter', sans-serif", fontSize: 14, color: '#8A8A92', lineHeight: 1.55 }}>
             Nothing logged yet. Run a few drill rounds and your timing, accuracy, and weak topics will show up here.
           </div>
@@ -774,9 +1060,9 @@ function StatsTab({ history, flashHistory }) {
   const topicRows = Object.entries(byTopic).map(([t, e]) => ({ t, n: e.length, avg: (e.reduce((s, h) => s + (h.selfRating || 0), 0) / e.length) })).sort((a, b) => a.avg - b.avg);
 
   return (
-    <div style={{ padding: '36px 20px 0' }}>
-      <Eyebrow>Progress</Eyebrow>
-      <div style={{ fontFamily: "'Source Serif 4', serif", fontSize: 22, color: '#F5F1E8', margin: '8px 0 22px' }}>
+    <div style={{ padding: pad }}>
+      {!embedded && <Eyebrow>Progress</Eyebrow>}
+      <div style={{ fontFamily: "'Source Serif 4', serif", fontSize: 22, color: '#F5F1E8', margin: embedded ? '0 0 22px' : '8px 0 22px' }}>
         {history.length} rounds · {flashHistory.length} cards
       </div>
       <div style={{ display: 'flex', gap: 28, marginBottom: 28 }}>
@@ -817,7 +1103,7 @@ function StatsTab({ history, flashHistory }) {
 // ===========================================================================
 // MORE
 // ===========================================================================
-function MoreTab({ librarySize, queueCount, onImport, onQueue, onSettings }) {
+function MoreTab({ librarySize, queueCount, motionCount, onImport, onQueue, onSettings, onStats }) {
   const Row = ({ title, sub, onClick, badge }) => (
     <button onClick={onClick} style={{ width: '100%', textAlign: 'left', background: '#161618', border: '1px solid #1E1E22', borderRadius: 12, padding: '16px 18px', cursor: 'pointer', display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 12 }}>
       <div>
@@ -831,6 +1117,7 @@ function MoreTab({ librarySize, queueCount, onImport, onQueue, onSettings }) {
     <div style={{ padding: '36px 20px 0' }}>
       <Eyebrow>Manage</Eyebrow>
       <div style={{ marginTop: 22 }}>
+        <Row title="Progress &amp; stats" sub="Timing, accuracy, weakest topics" onClick={onStats} />
         <Row title="Import library" sub={`${librarySize} arguments loaded`} onClick={onImport} />
         <Row title="Review AI drafts" sub="Fill thin topics, approve before they count" onClick={onQueue} badge={queueCount > 0 ? queueCount : null} />
         <Row title="Settings &amp; reset" sub="Clear library or progress" onClick={onSettings} />
